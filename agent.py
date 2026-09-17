@@ -4,12 +4,13 @@
 ветвления (проверок) на графе состояний:
 
     check_memory → classify → retrieve → check_relevance → generate
-    → validate → check_validation → save → finish
+    → check_answer → validate → check_validation → save → finish
 
 плюс ветви:
     check_memory: hit ────────────────→ finish_cached
     classify: risk=high / parse_error → escalate
     check_relevance: нет контекста ────→ refuse
+    check_answer: пуст/длинный/источники → check_validation (ретрай)
     check_validation: не grounded ────→ generate (ретрай) / escalate
 
 Контекст — векторный поиск по базе знаний в Qdrant (Docker, паттерн DZ_4);
@@ -25,6 +26,7 @@ LLM — OpenAI-совместимый сервер (LM Studio); для selftest 
     .venv/bin/python agent.py "вопрос"         # один вопрос
     .venv/bin/python agent.py --demo           # 4 прогона, покрывающие все ветки
     .venv/bin/python agent.py --selftest       # самодиагностика без LLM
+    .venv/bin/python agent.py --eval           # gold set: оценка качества ответов
     .venv/bin/python agent.py --show-trace "вопрос"
 """
 
@@ -60,6 +62,8 @@ LLM_REQUEST_TIMEOUT_SECONDS = int(os.getenv("LLM_REQUEST_TIMEOUT_SECONDS", "120"
 
 KB_FILE = os.getenv("KB_FILE", "context/kb.json")
 QA_MEMORY_FILE = os.getenv("QA_MEMORY_FILE", "memory/qa.json")
+# Gold set для оценки качества ответов (--eval): вопросы + ожидаемые факты.
+EVAL_FILE = os.getenv("EVAL_FILE", "context/eval.json")
 
 # Векторный поиск (Qdrant, паттерн DZ_4)
 QDRANT_URL = os.getenv("QDRANT_URL", "http://localhost:6333")
@@ -71,12 +75,36 @@ EMBEDDING_DIM = int(os.getenv("EMBEDDING_DIM", "1024"))
 RELEVANCE_THRESHOLD = float(os.getenv("RELEVANCE_THRESHOLD", "0.3"))
 MEMORY_HIT_THRESHOLD = float(os.getenv("MEMORY_HIT_THRESHOLD", "1.5"))
 MAX_VALIDATION_RETRIES = int(os.getenv("MAX_VALIDATION_RETRIES", "2"))
-MAX_STEPS = int(os.getenv("MAX_STEPS", "15"))
+# Гард от зацикливания. Дефолт 18: наихудший честный прогон — 16 состояний
+# (check_memory + classify + retrieve + check_relevance + 3×(generate +
+# check_answer + validate + check_validation) при MAX_VALIDATION_RETRIES=2);
+# гард должен срабатывать только на настоящий цикл, а не на исчерпание ретраев.
+MAX_STEPS = int(os.getenv("MAX_STEPS", "18"))
+# Лимит длины ответа для детерминированной проверки check_answer.
+MAX_ANSWER_CHARS = int(os.getenv("MAX_ANSWER_CHARS", "2000"))
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "ERROR")
 logger = logging.getLogger("dz5.agent")
 
 END = "END"  # маркер: сценарий завершён
+
+# --- Классификация эскалаций --------------------------------------------------
+# Safety-эскалации — штатное безопасное поведение агента (ветка risk=high),
+# не ошибка. Всё остальное — техническая ошибка (сбой состояния, гард,
+# провал валидаций).
+
+SAFETY_ESCALATION_REASONS = frozenset({"high_risk"})
+
+
+def is_safety_escalation(reason: Optional[str]) -> bool:
+    """Штатная safety/business-эскалация (high_risk) — не ошибка."""
+    return reason in SAFETY_ESCALATION_REASONS
+
+
+def is_technical_escalation(reason: Optional[str]) -> bool:
+    """Техническая ошибка (step_error:*, max_steps, classification_failed,
+    grounding_validation_failed, answer_check_failed) — требует внимания."""
+    return reason is not None and not is_safety_escalation(reason)
 
 
 def _resolve(path: str) -> str:
@@ -140,6 +168,7 @@ class ScenarioConfig:
     memory_hit_threshold: float = MEMORY_HIT_THRESHOLD
     max_validation_retries: int = MAX_VALIDATION_RETRIES
     max_steps: int = MAX_STEPS
+    max_answer_chars: int = MAX_ANSWER_CHARS
 
 
 @dataclass
@@ -150,6 +179,9 @@ class WorkflowContext:
     docs: list[RetrievedDoc] = field(default_factory=list)
     answer: str = ""
     validation: dict[str, Any] = field(default_factory=dict)
+    # Кто записал текущий провал: "check_answer" (детерминированная проверка)
+    # или "" (LLM-валидатор) — определяет причину финальной эскалации.
+    validation_source: str = ""
     retry_count: int = 0
     validation_ok: bool = False
     can_retry: bool = False
@@ -490,7 +522,9 @@ class FakeLLM:
       default    — низкий риск, валидатор принимает ответ;
       risky      — классификатор возвращает risk="high";
       ungrounded — валидатор всегда отвергает ответ;
-      loop       — как ungrounded (для проверки гарда по шагам).
+      loop       — как ungrounded (для проверки гарда по шагам);
+      badformat  — генерация ссылается на несуществующий doc-fake
+                   (проверка check_answer).
     """
 
     def __init__(self, mode: str = "default") -> None:
@@ -515,6 +549,8 @@ class FakeLLM:
                 if grounded else "в ответе есть факты, которых нет в контексте",
             }, ensure_ascii=False)
         # Генерация: doc-id берём из маркеров [doc_id] в контекстном блоке.
+        if self.mode == "badformat":
+            return "Ответ составлен по базе знаний. [источники: doc-fake]"
         doc_ids = list(dict.fromkeys(re.findall(r"\[([a-z0-9][a-z0-9-]*)\]", user)))
         src = ", ".join(doc_ids) if doc_ids else "документы не указаны"
         return f"Ответ составлен по базе знаний. [источники: {src}]"
@@ -582,7 +618,8 @@ class Workflow:
         current = self.entry
         while current != END:
             # Гард от зацикливания: лимит на число состояний за прогон
-            # (петля generate → validate → check_validation — реальный цикл графа).
+            # (петля generate → check_answer → validate → check_validation —
+            # реальный цикл графа).
             if len(ctx.trace) >= self.max_steps:
                 ctx.result = AgentResult(
                     outcome=Outcome.ESCALATED,
@@ -620,8 +657,37 @@ class Workflow:
 
 
 # --------------------------------------------------------------------------- #
-# Сценарий: тикет поддержки (5 шагов + 4 ветвления)
+# Сценарий: тикет поддержки (5 шагов + 5 ветвлений)
 # --------------------------------------------------------------------------- #
+
+def _answer_problem(answer: str, known_ids: set[str], retrieved_ids: set[str],
+                    max_chars: int) -> Optional[str]:
+    """Детерминированная проверка ответа. Возвращает причину провала или None.
+
+    - ответ непустой;
+    - длина <= max_chars;
+    - id в блоке [источники: …] существуют в базе знаний
+      (защита от «галлюцинированных» источников);
+    - id в блоке [источники: …] — среди документов, реально полученных
+      текущим поиском (top-k): модель может цитировать только то,
+      что увидела в контексте.
+    """
+    if not answer.strip():
+        return "ответ пуст"
+    if len(answer) > max_chars:
+        return f"ответ длиннее {max_chars} символов (сейчас {len(answer)})"
+    m = re.search(r"\[источники:\s*([^\]]+)\]", answer)
+    if m:
+        cited = [t.strip() for t in m.group(1).split(",")]
+        cited = [t for t in cited if t and t != "документы не указаны"]
+        unknown = [t for t in cited if t not in known_ids]
+        if unknown:
+            return f"в источниках несуществующие id: {', '.join(unknown)}"
+        stale = [t for t in cited if t not in retrieved_ids]
+        if stale:
+            return f"источники не получены текущим поиском: {', '.join(stale)}"
+    return None
+
 
 def build_scenario(
     chat: ChatFn,
@@ -632,6 +698,7 @@ def build_scenario(
     config: ScenarioConfig,
 ) -> Workflow:
     """Собирает граф состояний сценария. Зависимости захватываются замыканиями."""
+    known_doc_ids = {d.doc_id for d in kb}
 
     # -- check_memory: вопрос уже был? ---------------------------------------
     def _act_check_memory(ctx: WorkflowContext) -> None:
@@ -702,13 +769,32 @@ def build_scenario(
         ctx.answer = chat(ANSWER_SYSTEM_PROMPT, user)
 
     def _route_generate(ctx: WorkflowContext) -> str:
-        return "validate"
+        return "check_answer"
+
+    # -- check_answer: детерминированная проверка ответа (без LLM) --------------
+    def _act_check_answer(ctx: WorkflowContext) -> None:
+        # Источники сверяем и с БЗ (галлюцинации), и с топ-k текущего поиска —
+        # модель видела в контексте только эти документы.
+        retrieved_ids = {d.document.doc_id for d in ctx.docs}
+        reason = _answer_problem(ctx.answer, known_doc_ids, retrieved_ids,
+                                 config.max_answer_chars)
+        if reason:
+            # Провал оформляем как валидационный — ретраи работают как обычно,
+            # а причина финальной эскалации будет answer_check_failed.
+            ctx.validation = {"grounded": False, "reason": f"проверка ответа: {reason}"}
+            ctx.validation_source = "check_answer"
+        else:
+            ctx.validation_source = ""
+
+    def _route_check_answer(ctx: WorkflowContext) -> str:
+        return "check_validation" if ctx.validation_source == "check_answer" else "validate"
 
     # -- validate: grounding-проверка (шаг 4) -----------------------------------
     def _act_validate(ctx: WorkflowContext) -> None:
         context_block = "\n\n".join(d.document.text for d in ctx.docs)
         user = f"Контекст:\n{context_block}\n\nОтвет для проверки:\n{ctx.answer}"
         ctx.validation = _chat_json(chat, VALIDATE_SYSTEM_PROMPT, user)
+        ctx.validation_source = ""
 
     def _route_validate(ctx: WorkflowContext) -> str:
         return "check_validation"
@@ -727,7 +813,12 @@ def build_scenario(
             return "save"
         if ctx.can_retry:
             return "generate"
-        ctx.escalate_reason = "grounding_validation_failed"
+        # Причина зависит от того, кто отверг ответ: детерминированная
+        # проверка (check_answer) или LLM-валидатор.
+        ctx.escalate_reason = (
+            "answer_check_failed" if ctx.validation_source == "check_answer"
+            else "grounding_validation_failed"
+        )
         return "escalate"
 
     # -- save: сохранение в память (шаг 5) ---------------------------------------
@@ -788,6 +879,7 @@ def build_scenario(
         "retrieve": State("retrieve", _act_retrieve, _route_retrieve),
         "check_relevance": State("check_relevance", _act_check_relevance, _route_check_relevance),
         "generate": State("generate", _act_generate, _route_generate),
+        "check_answer": State("check_answer", _act_check_answer, _route_check_answer),
         "validate": State("validate", _act_validate, _route_validate),
         "check_validation": State("check_validation", _act_check_validation, _route_check_validation),
         "save": State("save", _act_save, _route_save),
@@ -804,6 +896,156 @@ def run_scenario(query: str, workflow: Workflow) -> AgentResult:
 
 
 # --------------------------------------------------------------------------- #
+# Оценка качества ответов: gold set (вопросы + ожидаемые факты)
+# --------------------------------------------------------------------------- #
+
+@dataclass(frozen=True)
+class EvalCase:
+    """Gold-кейс: вопрос, ожидаемый итог, ожидаемые факты ответа и источник."""
+    id: str
+    query: str
+    expect_outcome: str  # "answered" (включая answered_cached) | "refused" | "escalated"
+    expect_facts: tuple[str, ...]
+    expect_source: Optional[str]
+
+
+@dataclass
+class EvalCaseResult:
+    """Результат прогона gold-кейса: итог, доля фактов, источник."""
+    case: EvalCase
+    result: Optional[AgentResult]
+    facts_matched: int
+    facts_total: int
+    source_ok: bool
+    passed: bool
+    error: Optional[str] = None
+
+
+def load_eval_cases(path: str) -> list[EvalCase]:
+    """Загружает gold set и валидирует его (известный outcome, непустые вопросы)."""
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    cases: list[EvalCase] = []
+    for c in data.get("cases", []):
+        outcome = c["expect_outcome"]
+        if outcome not in ("answered", "refused", "escalated"):
+            raise ValueError(f"кейс {c.get('id')}: неизвестный expect_outcome «{outcome}»")
+        if not str(c.get("query", "")).strip():
+            raise ValueError(f"кейс {c.get('id')}: пустой вопрос")
+        cases.append(EvalCase(
+            id=str(c["id"]),
+            query=str(c["query"]),
+            expect_outcome=outcome,
+            expect_facts=tuple(c.get("expect_facts", [])),
+            expect_source=c.get("expect_source"),
+        ))
+    if not cases:
+        raise ValueError(f"gold set пуст: {path}")
+    return cases
+
+
+def _normalize(text: str) -> str:
+    """Нормализация для сверки фактов: нижний регистр, схлопывание пробелов."""
+    return re.sub(r"\s+", " ", text.lower()).strip()
+
+
+def match_facts(answer: str, facts: list[str]) -> tuple[list[str], list[str]]:
+    """Какие ожидаемые факты (подстроки) есть в ответе. → (есть, отсутствуют)."""
+    a = _normalize(answer)
+    matched = [f for f in facts if _normalize(f) in a]
+    missed = [f for f in facts if _normalize(f) not in a]
+    return matched, missed
+
+
+def _outcome_ok(expect: str, actual: Outcome) -> bool:
+    """«answered» засчитывается и для answered, и для answered_cached."""
+    if expect == "answered":
+        return actual in (Outcome.ANSWERED, Outcome.ANSWERED_CACHED)
+    return actual.value == expect
+
+
+def run_eval(cases: list[EvalCase], workflow: Workflow) -> list[EvalCaseResult]:
+    """Прогоняет gold set: по каждому кейсу — итог, факты, источник.
+
+    Кейс PASSED: ожидаемый итог + все ожидаемые факты в ответе +
+    ожидаемый источник в sources. Ошибка LLM — ERROR по кейсу, не падение.
+    """
+    results: list[EvalCaseResult] = []
+    for case in cases:
+        try:
+            result = workflow.run(WorkflowContext(query=case.query))
+        except openai.APIError as e:
+            results.append(EvalCaseResult(
+                case=case, result=None,
+                facts_matched=0, facts_total=len(case.expect_facts),
+                source_ok=False, passed=False,
+                error=f"{e.__class__.__name__}: {str(e)[:200]}",
+            ))
+            continue
+        matched, _missed = match_facts(result.message, list(case.expect_facts))
+        facts_total = len(case.expect_facts)
+        source_ok = (case.expect_source in result.sources) if case.expect_source else True
+        passed = (_outcome_ok(case.expect_outcome, result.outcome)
+                  and len(matched) == facts_total and source_ok)
+        results.append(EvalCaseResult(
+            case=case, result=result,
+            facts_matched=len(matched), facts_total=facts_total,
+            source_ok=source_ok, passed=passed,
+        ))
+    return results
+
+
+def print_eval_report(results: list[EvalCaseResult]) -> int:
+    """Таблица по кейсам + сводка качества. Возвращает число не пройденных."""
+    print(f"{'№':<4}{'кейс':<14}{'итог':<18}{'факты':>7}{'источник':>10}  результат")
+    for i, er in enumerate(results, 1):
+        if er.result is None:
+            print(f"{i:<4}{er.case.id:<14}{'—':<18}{'—':>7}{'—':>10}  "
+                  f"ERROR: {er.error}")
+            continue
+        facts = f"{er.facts_matched}/{er.facts_total}" if er.facts_total else "—"
+        source = "ок" if er.source_ok else "нет"
+        print(f"{i:<4}{er.case.id:<14}{er.result.outcome.value:<18}{facts:>7}"
+              f"{source:>10}  {'PASS' if er.passed else 'FAIL'}")
+        if not er.passed:
+            if er.result.outcome.value != er.case.expect_outcome:
+                print(f"       итог: {er.result.outcome.value} "
+                      f"(ожидалось {er.case.expect_outcome})")
+            _, missed = match_facts(er.result.message, list(er.case.expect_facts))
+            if missed:
+                print(f"       нет фактов: {', '.join(missed)}")
+            if not er.source_ok:
+                print(f"       нет источника: {er.case.expect_source} "
+                      f"(фактически: {', '.join(er.result.sources) or '—'})")
+    total = len(results)
+    passed = sum(1 for er in results if er.passed)
+    f_total = sum(er.facts_total for er in results)
+    f_matched = sum(er.facts_matched for er in results)
+    facts_str = (f"{f_matched}/{f_total} ({f_matched * 100 / f_total:.1f}%)"
+                 if f_total else "—")
+    print(f"Итог: кейсов пройдено {passed}/{total} ({passed * 100 / total:.1f}%) "
+          f"| факты: {facts_str}")
+    return total - passed
+
+
+def run_eval_cli(kb: list[Document], qmem, chat: ChatFn) -> int:
+    """--eval: gold set в изолированной среде (tmp-память, без записи в память)."""
+    cases = load_eval_cases(_resolve(EVAL_FILE))
+    qa_dir = tempfile.mkdtemp(prefix="dz5-eval-")
+    qa_path = os.path.join(qa_dir, "qa.json")
+    # Свежая память: doc-узлы из БЗ, qa-узлов нет — каждый кейс идёт
+    # полным пайплайном, не касаясь memory/qa.json.
+    memory = build_runtime_memory(kb, qa_path)
+    workflow = build_scenario(chat, kb, memory, qmem, qa_path, ScenarioConfig())
+    print(f"Оценка качества (gold set): {len(cases)} кейсов из "
+          f"{os.path.relpath(_resolve(EVAL_FILE), BASE_DIR)}; память (memory/qa.json) "
+          f"не трогается")
+    results = run_eval(cases, workflow)
+    failed = print_eval_report(results)
+    return 0 if failed == 0 else 1
+
+
+# --------------------------------------------------------------------------- #
 # Вывод и CLI
 # --------------------------------------------------------------------------- #
 
@@ -815,7 +1057,11 @@ def print_result(result: AgentResult, show_trace: bool = True) -> None:
     if result.sources:
         print(f"Источники: {', '.join(result.sources)}")
     if result.escalated_reason:
-        print(f"Причина: {result.escalated_reason}")
+        # high_risk — штатная safety-эскалация (не ошибка), остальное —
+        # техническая ошибка; разделяем явно, чтобы «ошибка» не пугала.
+        kind = ("safety-эскалация" if is_safety_escalation(result.escalated_reason)
+                else "техническая ошибка")
+        print(f"Причина: {result.escalated_reason} ({kind})")
     if result.memory_saved:
         print("Сохранено в память (qa.json).")
 
@@ -908,7 +1154,7 @@ def _gen_call_count(chat: FakeLLM) -> int:
 
 
 def selftest() -> int:
-    """7 проверок без LLM, без Qdrant и без сети (FakeLLM + мок Qdrant + TF-IDF)."""
+    """10 проверок без LLM, без Qdrant и без сети (FakeLLM + мок Qdrant + TF-IDF)."""
     failures: list[str] = []
 
     def check(name: str, fn: Callable[[], None]) -> None:
@@ -919,7 +1165,7 @@ def selftest() -> int:
             print(f"[FAIL] {name}: {e!r}")
             failures.append(name)
 
-    # 1. Граф валиден: все переходы к существующим состояниям, все 12 состояний
+    # 1. Граф валиден: все переходы к существующим состояниям, все 13 состояний
     #    достижимы (объединение trace пяти прогонов покрывает весь граф).
     def t1_graph_valid() -> None:
         env = _selftest_env("default")
@@ -945,7 +1191,8 @@ def selftest() -> int:
         result = env["workflow"].run(WorkflowContext(query=HAPPY_QUERY))
         expected_trace = [
             "check_memory", "classify", "retrieve", "check_relevance",
-            "generate", "validate", "check_validation", "save", "finish",
+            "generate", "check_answer", "validate", "check_validation",
+            "save", "finish",
         ]
         assert result.trace == expected_trace, f"trace: {result.trace}"
         assert result.outcome == Outcome.ANSWERED, result.outcome
@@ -1025,13 +1272,89 @@ def selftest() -> int:
         assert result.escalated_reason == "max_steps", result.escalated_reason
         assert len(result.trace) <= 8, f"trace: {result.trace}"
 
-    check("граф валиден: все 12 состояний достижимы, переходов в «фантазии» нет", t1_graph_valid)
-    check("success path: точный trace, ответ, сохранение в память", t2_success_path)
+    # 8. check_answer: badformat (doc-fake в источниках) → ретраи →
+    #    эскалация answer_check_failed, LLM-валидатор не вызывается;
+    #    документ из БЗ, но не из топ-k текущего поиска — тоже отклоняется.
+    def t8_check_answer() -> None:
+        env = _selftest_env("badformat")
+        result = env["workflow"].run(WorkflowContext(query=HAPPY_QUERY))
+        assert result.outcome == Outcome.ESCALATED, result.outcome
+        assert result.escalated_reason == "answer_check_failed", result.escalated_reason
+        assert "validate" not in result.trace, f"LLM-валидатор не должен вызываться: {result.trace}"
+        # classify + 3×generate (check_answer детерминированно отвергает каждый раз).
+        assert result.trace.count("generate") == 1 + ScenarioConfig().max_validation_retries
+        assert result.memory_saved is False
+        # Retrieval-область: id существует в БЗ, но не получен текущим поиском
+        # → ответ отвергается (модель цитирует только то, что видела).
+        kb = load_documents(_resolve(KB_FILE))
+        all_ids = {d.doc_id for d in kb}
+        stale = next(d for d in kb if d.doc_id != "doc-certificate")
+        reason = _answer_problem(
+            f"Ответ. [источники: {stale.doc_id}]", all_ids, {"doc-certificate"}, 2000)
+        assert reason and "не получены текущим поиском" in reason, f"reason: {reason}"
+        reason = _answer_problem("Ответ. [источники: doc-fake]", all_ids, all_ids, 2000)
+        assert reason and "несуществующие id" in reason, f"reason: {reason}"
+        assert _answer_problem(
+            "Ответ. [источники: doc-certificate]", all_ids, {"doc-certificate"}, 2000
+        ) is None
+
+    # 9. Классификация эскалаций: high_risk — safety, всё остальное — technical.
+    def t9_escalation_kinds() -> None:
+        assert is_safety_escalation("high_risk")
+        assert not is_safety_escalation("step_error:generate")
+        assert not is_safety_escalation(None)
+        assert is_technical_escalation("step_error:generate")
+        assert is_technical_escalation("max_steps")
+        assert is_technical_escalation("classification_failed")
+        assert is_technical_escalation("grounding_validation_failed")
+        assert is_technical_escalation("answer_check_failed")
+        assert not is_technical_escalation("high_risk")
+        assert not is_technical_escalation(None)
+
+    # 10. Gold set: файл валиден (каждый факт — подстрока текста ожидаемого
+    #     источника в БЗ), harness на FakeLLM считает итоги, факты и источники.
+    def t10_gold_set() -> None:
+        cases = load_eval_cases(_resolve(EVAL_FILE))
+        assert len(cases) >= 4, f"кейсов мало: {len(cases)}"
+        docs = {d.doc_id: d for d in load_documents(_resolve(KB_FILE))}
+        for c in cases:
+            assert c.id and c.query.strip(), f"пустой кейс: {c}"
+            if c.expect_source:
+                doc = docs.get(c.expect_source)
+                assert doc, f"кейс {c.id}: источник {c.expect_source} нет в БЗ"
+                for fact in c.expect_facts:
+                    assert fact.lower() in doc.text.lower(), (
+                        f"кейс {c.id}: факт «{fact}» не найден в тексте {c.expect_source}")
+        # Harness на FakeLLM (default): итоги верные, счёт фактов и источников
+        # работает (универсальный ответ заглушки факты не содержит — и так и есть).
+        env = _selftest_env("default")
+        results = run_eval(cases, env["workflow"])
+        assert len(results) == len(cases), "результатов не по числу кейсов"
+        by_id = {er.case.id: er for er in results}
+        assert by_id["certificate"].result.outcome == Outcome.ANSWERED
+        assert by_id["off-topic"].result.outcome == Outcome.REFUSED
+        cert = by_id["certificate"]
+        assert cert.facts_total > 0 and cert.facts_matched < cert.facts_total, (
+            f"у FakeLLM факты не должны совпасть: {cert.facts_matched}/{cert.facts_total}")
+        assert cert.source_ok, "FakeLLM цитирует retrieved-документы — источник должен найтись"
+        assert by_id["off-topic"].passed, "refused-кейс без фактов должен проходить"
+        # Юнит match_facts: регистр и пробелы не мешают, отсутствующий факт — в missed.
+        m, ms = match_facts("Сертификат выдадут в личном кабинете за 5 рабочих дней",
+                            ["личном кабинете", "5 рабочих дней", "возврат"])
+        assert m == ["личном кабинете", "5 рабочих дней"] and ms == ["возврат"]
+
+    check("граф валиден: все 13 состояний достижимы, переходов в «фантазии» нет", t1_graph_valid)
+    check("success path: точный trace с check_answer, ответ, сохранение в память", t2_success_path)
     check("ветка «нет контекста»: отказ, память не пополняется", t3_refuse_branch)
     check("провал валидации: ретраи исчерпаны → эскалация", t4_validation_retry)
     check("высокий риск: эскалация после классификации, без генерации", t5_high_risk)
     check("хит в памяти: ответ из памяти, без новой генерации", t6_memory_hit)
     check("гард MAX_STEPS: бесконечный ретрай останавливается", t7_step_guard)
+    check("check_answer: галлюцинированный источник → answer_check_failed", t8_check_answer)
+    check("классификация эскалаций: high_risk — safety, остальное — technical",
+          t9_escalation_kinds)
+    check("gold set: факты валидны против БЗ, harness считает качество ответов",
+          t10_gold_set)
 
     if failures:
         print(f"SELF-TEST: {len(failures)} упало: {', '.join(failures)}")
@@ -1057,6 +1380,8 @@ def main() -> None:
     parser.add_argument("question", nargs="*", help="одиночный вопрос")
     parser.add_argument("--demo", action="store_true", help="4 прогона, покрывающие все ветки")
     parser.add_argument("--selftest", action="store_true", help="самодиагностика без LLM")
+    parser.add_argument("--eval", action="store_true",
+                        help="gold set: оценка качества ответов (нужны LLM и Qdrant)")
     parser.add_argument("--show-trace", action="store_true",
                         help="печатать путь по состояниям графа")
     args = parser.parse_args()
@@ -1078,6 +1403,8 @@ def main() -> None:
     )
 
     try:
+        if args.eval:
+            sys.exit(run_eval_cli(kb, qmem, chat))
         if args.demo:
             run_demo(workflow)
         elif args.question:
